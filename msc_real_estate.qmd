@@ -1,0 +1,1577 @@
+---
+title: "Pet-проект: «Прогноз и анализ цен на недвижимость с геопространственными данными»"
+
+format:
+  html:
+    self-contained: true        # всё в одном HTML
+    toc: true                   # включаем кликабельное содержание
+    toc-depth: 3                 # глубина заголовков
+    toc-title: "Содержание"     # заголовок TOC
+    toc-location: left          # расположение TOC слева
+    toc-collapsible: true       # сворачиваемое TOC
+    number-sections: true       # нумерация секций
+
+jupyter:
+  kernel: quarto_env
+
+# code-fold: true                # сворачиваемый код
+---
+
+
+
+Целью данного проекта является анализ факторов, влияющих на цены жилой недвижимости, а также построение моделей, позволяющих прогнозировать цену за квадратный метр на основе характеристик объекта и его пространственного расположения.
+
+Рынок недвижимости обладает выраженной пространственной структурой: объекты, расположенные рядом, часто имеют схожую стоимость из-за общих характеристик района, инфраструктуры и транспортной доступности. Поэтому в проекте используются как классические методы машинного обучения, так и методы пространственной эконометрики, позволяющие учитывать пространственную зависимость цен.
+
+Проект решает две основные задачи:
+
+- объяснить, какие факторы влияют на стоимость жилья;
+
+- построить модель, способную прогнозировать цену объектов недвижимости
+
+В проекте используется датасет объявлений о продаже квартир, содержащий:
+
+характеристики объектов:
+
+- этаж квартиры (floor)
+
+- количество комнат (rooms)
+
+- цена за квадратный метр (price_sq_m)
+
+пространственные характеристики :
+
+- координаты объектов
+
+- район города (district)
+
+- расстояние до ближайшей станции метро (dist_to_metro); расчитаны на основе данных OSM
+
+- расстояние до центра города (dist_to_center); расчитаны на основе данных OSM
+
+Дополнительно были рассчитаны пространственные признаки, отражающие локальную структуру рынка:
+
+- spatial price lag (price_lag) — средняя цена соседних объектов
+
+## Импорт библиотек
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# import importlib
+# import subprocess
+# import sys
+
+# libs = ['kagglehub', 'shap', 'geopandas', 'shapely', 'osmnx',
+#         'contextily', 'networkx', 'geoplot', 'libpysal', 'statsmodels', 'spreg',
+#         'esda', 'splot', 'xgboost', 'plotly', 'mapclassify', 'pysal']
+
+# for lib in libs:
+#     try:
+#         importlib.import_module(lib)
+#         print(f'Библиотека {lib} уже установлена')
+#     except ImportError:
+#         print(f'Устанавливаю {lib}...')
+#         subprocess.check_call([sys.executable, "-m", "pip", "install", lib])
+```
+
+```{python}
+import kagglehub
+import pandas as pd
+import os
+import zipfile
+import numpy as np
+import geopandas as gpd
+import contextily as cx
+import networkx as nx
+from shapely.geometry import Point
+import osmnx as ox
+from shapely.ops import nearest_points
+from sklearn.neighbors import KDTree
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.ensemble import RandomForestRegressor
+import seaborn as sns
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import plotly.express as px
+import plotly.graph_objects as go
+import geoplot as gplt
+from libpysal.weights import DistanceBand, Queen
+import statsmodels.api as sm
+from spreg import OLS, ML_Lag, ML_Error, GM_Lag, GM_Error
+from esda.moran import Moran, Moran_Local
+from splot.esda import moran_scatterplot
+import shap
+from libpysal.weights import KNN
+from scipy.ndimage import gaussian_filter
+import matplotlib.colors as mcolors
+from scipy.stats import pearsonr
+import mapclassify as mc
+import cartopy.crs as ccrs
+import pysal as ps
+```
+
+```{python}
+plt.style.use("ggplot")
+```
+
+## **Подготовка данных**
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# Download latest version
+path = kagglehub.dataset_download(
+    "vasiliispe/real-estate-moscow-and-moscow-region"
+    )
+
+print("Path to dataset files:", path)
+```
+
+Эти данные собирались за ноябрь 2023 г., поэтому может немного страдать репрезентативность и актуальность, но пока для простоты и удобства анализируются именно они. В будущем можно заняться самостоятельным сбором из открытых агрегаторов продажи недвижимости
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+files = os.listdir(path)
+print(files)
+
+df = pd.read_csv(os.path.join(path, files[0]))
+df.head()
+```
+
+```{python}
+print(df.info())
+```
+
+В датасете 98,8 тыс. наблюдений и достаточно много признаков, но берем только цену, координаты, площадь (для расчета цены за кв.м), комнаты, этаж и район. И, конечно, геометрию
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 382}
+#добавляем столбец с ценой за квадратный метр
+df['price_sq_m'] = df.price / df.total_square
+df.price_sq_m = df.price_sq_m.apply(lambda x: round(x))
+df.head()
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 206}
+gdf = gpd.GeoDataFrame(df, geometry = gpd.points_from_xy(df.lon, df.lat),
+                       crs = 'EPSG:4326')
+gdf = gdf[['rooms', 'floor', 'district', 'price_sq_m', 'geometry']]
+gdf = gdf.to_crs('EPSG:3857')
+gdf.head()
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 633}
+ax = gdf.plot(figsize=(7, 7), markersize = 1.0, alpha = 0.5,
+              color = 'olivedrab')
+cx.add_basemap(ax, source=cx.providers.OpenStreetMap.Mapnik)
+plt.grid(False)
+plt.axis("off")
+ax.set_title('Объявления о продаже квартир в ноябре 2023 г.')
+ax.text(
+    0.65, 0.02,
+    f"Источник: Kaggle\nВсего объявлений: {len(gdf)}\nМин. цена за кв.м:{min(gdf.price_sq_m) / 1000:.2f} т.р.\nМакс. цена за кв.м:{max(gdf.price_sq_m)/ 1000:.2f} т.р.",
+    transform=ax.transAxes,
+    ha="left",
+    va="bottom",
+    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    fontsize=8,
+    color="black")
+plt.show()
+```
+
+В целом, объявления о продаже распределены достаточно равномерно по всей Москве, есть даже немного из Московской области, но дальнейшее моделирование будет основано только на тех, что административно внутри Москвы. К тому же, нет наблюдений из периферийных частей Новой Москвы (Троицкий АО)
+
+### Добавляем новые пространственные признаки
+
+*Ищем расстояния до метро и до центра города от каждой точки*
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 237}
+#выгружаем с OSM станции метро
+city = "Moscow, Russia"
+tags = {'railway': 'station', 'station': 'subway'}
+metro = ox.features.features_from_place(query = city, tags = tags)
+metro = metro[['geometry', 'name']].to_crs('EPSG:3857')
+metro.head()
+```
+
+```{python}
+metro_points = metro[metro.geometry.type == "Point"].copy()
+```
+
+```{python}
+#загружаем граф УДС Москвы
+G = ox.graph_from_place(
+    "Moscow, Russia",
+    network_type="drive",
+    simplify=True
+)
+G = ox.project_graph(G, to_crs = 'EPSG:3857')  # перевод в метрическую систему
+```
+
+```{python}
+#привязка к ближайшим узлам графа
+gdf["node"] = ox.nearest_nodes(G, gdf.geometry.x, gdf.geometry.y)
+metro_points["node"] = ox.nearest_nodes(G,
+                                        metro_points.geometry.x,
+                                        metro_points.geometry.y)
+```
+
+```{python}
+#считаем расстояние Дийкстрой
+metro_nodes = metro_points["node"].unique().tolist()
+
+# считаем расстояние от ВСЕХ узлов до ближайшей станции метро
+lengths = nx.multi_source_dijkstra_path_length(G, metro_nodes, weight="length")
+
+# теперь просто мапим
+gdf["dist_to_metro"] = gdf["node"].map(lengths)
+```
+
+```{python}
+#расстояния до центра тем же способом
+center_lat = 55.752023
+center_lon = 37.617499
+
+center_point = gpd.GeoSeries([Point(center_lon, center_lat)], crs="EPSG:4326")
+center_point = center_point.to_crs(G.graph["crs"])
+
+center_node = ox.nearest_nodes(G, center_point.x.iloc[0], center_point.y.iloc[0])
+
+lengths = nx.single_source_dijkstra_path_length(
+    G,
+    center_node,
+    weight="length"
+)
+gdf["dist_to_center"] = gdf["node"].map(lengths)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+print(gdf["dist_to_center"].min())
+print(gdf["dist_to_center"].max())
+```
+
+```{python}
+#добавляем пространственный лаг
+
+coords = np.vstack([gdf.geometry.x, gdf.geometry.y]).T
+tree = KDTree(coords, metric='euclidean')
+
+radius = 1000 #радиус для простоты подобран эвристически
+neighbors = tree.query_radius(coords, r=radius)
+
+lag = []
+for i, inds in enumerate(neighbors):
+    inds = inds[inds != i]
+    if len(inds) > 0:
+        lag.append(gdf.iloc[inds]['price_sq_m'].mean())
+    else:
+        lag.append(gdf['price_sq_m'].mean())
+
+gdf['price_lag'] = lag
+```
+
+На этапе подготовки данных были выполнены следующие шаги:
+
+- очистка данных и удаление пропущенных значений;
+
+- расчет расстояний до ключевых объектов инфраструктуры:
+
+    - расстояние до ближайшей станции метро
+
+    - расстояние до центра города;
+
+- построение пространственного лага цен с использованием соседних объектов;
+
+- кодирование категориальной переменной района для использования в ML-моделях.
+
+Полученные признаки отражают как характеристики самой квартиры, так и пространственные особенности её расположения.
+
+## **Дескриптивный анализ**
+
+
+
+
+
+
+### Графики
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 507}
+# Список показателей для гистограмм
+features_to_plot = [
+    'price_sq_m',
+    'floor',
+    'rooms',
+    'dist_to_metro',
+    'price_lag',
+    'dist_to_center'
+]
+
+# Создаем фигуру и сетку для подграфиков (например, 2 строки, 3 столбца)
+fig, axes = plt.subplots(2, 3, figsize=(9, 5))
+axes = axes.flatten() # Преобразуем 2D массив осей в 1D для удобной итерации
+
+# Проходим по каждому показателю и строим гистограмму
+for i, feature in enumerate(features_to_plot):
+    sns.histplot(data=gdf, x=feature, kde=True, ax=axes[i], color='hotpink')
+    axes[i].set_title(f'Распределение {feature}', fontsize = 11)
+    axes[i].set_xlabel(feature)
+    axes[i].set_ylabel('Частота')
+
+plt.tight_layout() # Обеспечиваем плотное размещение подграфиков
+plt.show()
+```
+
+Распределение большинства признаков (кроме расстояния до центра) смещено влево (имеет логнормальный вид). Предложение смещено в сторону более массовых категорий жилой недвижимости.
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 507}
+# Создаем логарифмированные версии переменных (кроме rooms и dist_to_center)
+gdf_log = gdf.copy()
+gdf_log['log_price_sq_m'] = np.log1p(gdf['price_sq_m'])
+#gdf_log['log_floor'] = np.log1p(gdf['floor'])
+gdf_log['log_dist_to_metro'] = np.log1p(gdf['dist_to_metro'])
+gdf_log['log_price_lag'] = np.log1p(gdf['price_lag'])
+
+# Список показателей для гистограмм, включая логарифмированные и оригинальные
+features_to_plot_log = [
+    'log_price_sq_m',
+    'floor',
+    'rooms',
+    'log_dist_to_metro',
+    'log_price_lag',
+    'dist_to_center'
+]
+
+# Создаем фигуру и сетку для подграфиков (например, 2 строки, 3 столбца)
+fig, axes = plt.subplots(2, 3, figsize=(9, 5))
+axes = axes.flatten() # Преобразуем 2D массив осей в 1D для удобной итерации
+
+# Проходим по каждому показателю и строим гистограмму
+for i, feature in enumerate(features_to_plot_log):
+    if feature == 'log_dist_to_metro':
+        # Фильтруем данные, чтобы исключить нули для log_dist_to_metro
+        filtered_data = gdf_log[gdf_log['log_dist_to_metro'] != 0]
+        sns.histplot(data=filtered_data, x=feature, kde=True, ax=axes[i],
+                     color='lightcoral')
+    else:
+        sns.histplot(data=gdf_log, x=feature, kde=True, ax=axes[i],
+                     color='lightcoral')
+    axes[i].set_title(f'Распределение {feature}', fontsize = 11)
+    axes[i].set_xlabel(feature)
+    axes[i].set_ylabel('Частота')
+
+plt.tight_layout() # Обеспечиваем плотное размещение подграфиков
+plt.show()
+```
+
+Логарифмирование помогает привести их в более "нормальный" вид распределения
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 482}
+sns.regplot(
+    data=gdf,
+    x='dist_to_center',
+    y='price_sq_m',
+    scatter_kws={'s': 1, 'alpha': 0.5},
+    lowess=True,
+    line_kws={'color': 'blueviolet'}
+)
+
+plt.title("Зависимость стоимости кв. метра от расстояния до центра", fontsize=12)
+plt.xlabel("Расстояние до центра")
+plt.ylabel("Стоимость кв. метра")
+```
+
+Естественно, наблюдается близкая к гиперболической обратная зависимость между расстоянием до центра и стоимостью квадратного метра.
+Но видны группировки наблюдений возле отдельных значений расстояния - вероятно, вследствие расчета признака (квартиры привязываются к узлам графа для поиска кратчайшего расстояния, особенно в случае периферийных объектов с низкой ценой - заметно в правой нижней части графика). Это может сказаться на качестве производимых далее расчетов
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 699}
+# Матрица корреляций
+features = ['price_sq_m', 'floor', 'rooms', 'dist_to_metro',
+            'price_lag', 'dist_to_center']
+
+# Drop NaN values from the relevant columns to ensure pearsonr works correctly
+data_for_corr = gdf[features].dropna()
+
+# Calculate the Pearson correlation matrix
+corr = data_for_corr.corr()
+
+# Calculate p-values for each correlation coefficient
+p_values = pd.DataFrame(np.zeros((corr.shape[0], corr.shape[1])),
+                        columns=features, index=features)
+for col1 in features:
+    for col2 in features:
+        if col1 == col2:
+            p_values.loc[col1, col2] = 0.0 # Correlation with itself is 1, p-value is 0
+        else:
+            # pearsonr returns (correlation coefficient, p-value)
+            r, p = pearsonr(data_for_corr[col1], data_for_corr[col2])
+            p_values.loc[col1, col2] = p
+
+# Create a mask for non-significant correlations (p-value > 0.05)
+# These cells will be colored white on the heatmap
+mask_non_significant = p_values > 0.05
+
+# Plot the heatmap
+plt.figure(figsize=(8, 6)) # Увеличим размер для лучшей читаемости
+sns.heatmap(
+    corr,
+    annot=True,
+    cmap='coolwarm', # Цветовая палитра для корреляций
+    fmt='.2f', # Формат отображения значений коэффициентов
+    mask=mask_non_significant, # Применяем маску для незначимых корреляций
+    linewidths=.5, # Добавим линии между ячейками для лучшей визуализации
+    linecolor='black',
+    cbar_kws={'label': 'Коэффициент корреляции Пирсона', 'shrink': 0.6}
+)
+plt.title('Матрица корреляции с учетом статистической значимости (p > 0.05 закрашено белым)', fontsize = 12)
+plt.tight_layout()
+plt.show()
+```
+
+На основе матрицы корреляции видно 2 четкие обратные зависимости стоимости квадратного метра от показателей расстояния (значимость, престижность, статусность центра в Москве, как известно, высока). Также видна небольшая положительная связь с количеством комнат - сам факт наличия в квартире большого числа комнат может повышать ее ценность, вне зависимости от самой площади
+
+### Карты
+
+Здесь сначала строим визуализации отдельных признаков в точечной геометрии, затем с агрегацией по административным юнитам и в конце с ядерной плотностью
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+xmin, ymin, xmax, ymax = gdf.total_bounds
+
+# --- 1 карта: расстояние до метро ---
+gdf.plot(
+    column='dist_to_metro',
+    cmap='plasma_r',
+    legend=True,
+    markersize=1,
+    ax=axes[0],
+    legend_kwds={'shrink': 0.6}
+)
+
+metro_points.plot(ax=axes[0], color='dodgerblue', markersize=6.5)
+
+cx.add_basemap(axes[0], source=cx.providers.CartoDB.Positron)
+
+axes[0].set_title('Расстояние до метро по УДС', fontsize=13)
+axes[0].set_xlim(xmin, xmax)
+axes[0].set_ylim(ymin, ymax)
+axes[0].grid(False)
+axes[0].set_axis_off()
+
+
+# --- 2 карта: расстояние до центра ---
+gdf.plot(
+    column='dist_to_center',
+    cmap='plasma_r',
+    legend=True,
+    markersize=1,
+    ax=axes[1],
+    legend_kwds={'shrink': 0.6}
+)
+
+
+cx.add_basemap(axes[1], source=cx.providers.CartoDB.Positron)
+
+axes[1].set_title('Расстояние до центра по УДС', fontsize=13)
+axes[1].set_xlim(xmin, xmax)
+axes[1].set_ylim(ymin, ymax)
+axes[1].grid(False)
+axes[1].set_axis_off()
+
+
+plt.tight_layout()
+plt.show()
+```
+
+Просто визуализация признаков расстояния. На левом картографическом изображении как раз видны периферийные "узлы" привязки со схожими значениями расстояния.
+
+Картографические изображения с агрегацией
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# подгружаем слои с АТД Москвы
+path = kagglehub.dataset_download("jtremoureux/administrative-divisions-of-moscow")
+data_dir = path
+shp_path = os.path.join(data_dir, "moscow_adm.shp")  # замените имя файла, если другое
+moscow_admin = gpd.read_file(shp_path).to_crs('EPSG:3857')
+```
+
+```{python}
+# пространственный запрос на присоединение точек к районам
+gpd_sj = moscow_admin.sjoin(gdf, how = 'inner')
+```
+
+```{python}
+# группировка по районам и расчет статистик
+gpd_okrugs = gpd_sj.groupby('OKRUGS').agg(
+    mean_price=('price_sq_m', 'mean'),
+    count=('price_sq_m', 'count')
+)
+```
+
+```{python}
+# ресетим индекс чтобы было два измерения
+gpd_okrugs = gpd_okrugs.reset_index()
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 423}
+# присоединяем таблицу с названиями округов
+moscow_admin = gpd.read_file(shp_path).to_crs('EPSG:3857')
+result = pd.merge(gpd_okrugs, moscow_admin, on='OKRUGS', how = 'inner')
+result = gpd.GeoDataFrame(result, geometry='geometry')
+result
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 407}
+# карты по административным округам
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+# первая карта
+result.plot(
+    column='mean_price',
+    cmap='Reds',
+    legend=True,
+    ax=axes[0],
+    legend_kwds={'shrink': 0.6},
+    edgecolor='grey',
+    linewidth=0.5
+)
+
+cx.add_basemap(axes[0], source=cx.providers.CartoDB.Positron)
+axes[0].set_axis_off()
+axes[0].set_title("Средняя цена за кв.м, рублей", fontsize = 12)
+
+# вторая карта
+result.plot(
+    column='count',
+    cmap='Reds',
+    legend=True,
+    ax=axes[1],
+    legend_kwds={'shrink': 0.6},
+    edgecolor='grey',
+    linewidth=0.5
+)
+
+cx.add_basemap(axes[1], source=cx.providers.CartoDB.Positron)
+axes[1].set_axis_off()
+axes[1].set_title("Количество объявлений", fontsize = 12)
+
+plt.tight_layout()
+plt.show()
+```
+
+По цене - знакомый и привычный центрально-западный максимум. Дихотомия запад-восток, центр-периферия налицо.
+По количеству объявлений все скорее более случайно, но может быть связано с территориями, где вводится больше всего недвижимости. Из имеющихся здесь - это Новомосковские районы, Раменки, Очаково-Матвеевское. Вероятно на севере много строят по программам КРТ.
+
+```{python}
+# расчет статистик по районам
+gpd_rayon = gpd_sj.groupby('RAION').agg(
+    mean_price=('price_sq_m', 'mean'),
+    count=('price_sq_m', 'count')
+)
+```
+
+```{python}
+gpd_rayon = gpd_rayon.reset_index()
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 423}
+result_ray = pd.merge(gpd_rayon, moscow_admin, on='RAION', how = 'inner')
+result_ray = gpd.GeoDataFrame(result_ray, geometry='geometry')
+result_ray
+```
+
+Здесь картография идет по самим районам
+
+```{python}
+# 1. Для mean_price
+values_price = result_ray['mean_price'].dropna()
+# k_price = int(np.ceil(np.log2(len(values_price)) + 1))
+classifier_price = mc.FisherJenks(values_price, k=6)
+result_ray['price_class'] = classifier_price.yb
+
+# Цвета для price
+cmap_price = plt.cm.GnBu
+colors_price = [cmap_price(i/(6-1)) for i in range(6)]
+result_ray['price_color'] = result_ray['price_class'].apply(lambda x: colors_price[x])
+
+# 2. Для count
+values_count = result_ray['count'].dropna()
+# k_count = int(np.ceil(np.log2(len(values_count)) + 1))
+classifier_count = mc.FisherJenks(values_count, k=6)
+result_ray['count_class'] = classifier_count.yb
+
+# Цвета для count
+cmap_count = plt.cm.GnBu
+colors_count = [cmap_count(i/(6-1)) for i in range(6)]
+result_ray['count_color'] = result_ray['count_class'].apply(lambda x: colors_count[x])
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+# --- первая карта: mean_price ---
+result_ray.plot(
+    color=result_ray['price_color'],
+    ax=axes[0],
+    edgecolor='grey',
+    linewidth=0.5
+)
+cx.add_basemap(axes[0], source=cx.providers.CartoDB.Positron)
+axes[0].set_axis_off()
+axes[0].set_title("Средняя цена за кв.м., тыс. рублей", fontsize=12)
+
+# Легенда для price
+legend_elements_price = [
+    Patch(facecolor=colors_price[i], edgecolor='grey',
+          label=f"{classifier_price.bins[i-1] if i>0 else values_price.min():.0f} – {classifier_price.bins[i]:.0f}")
+    for i in range(6)
+]
+axes[0].legend(handles=legend_elements_price, title="Цена за кв.м.", loc='lower right',     
+               fontsize=8,          # уменьшенный размер шрифта
+            title_fontsize=10,   # размер заголовка легенды
+            handleheight=0.8,    # уменьшение высоты квадратика
+            handlelength=1.5)    # уменьшение длины квадратика)
+
+# --- вторая карта: count ---
+result_ray.plot(
+    color=result_ray['count_color'],
+    ax=axes[1],
+    edgecolor='grey',
+    linewidth=0.5
+)
+axes[1].set_axis_off()
+axes[1].set_title("Количество объявлений", fontsize=12)
+cx.add_basemap(axes[1], source=cx.providers.CartoDB.Positron)
+# Легенда для count
+legend_elements_count = [
+    Patch(facecolor=colors_count[i], edgecolor='grey',
+          label=f"{classifier_count.bins[i-1] if i>0 else values_count.min():.0f} – {classifier_count.bins[i]:.0f}")
+    for i in range(6)
+]
+axes[1].legend(handles=legend_elements_count, title="Количество", loc='lower right',      
+               fontsize=8,          # уменьшенный размер шрифта
+            title_fontsize=10,   # размер заголовка легенды
+            handleheight=0.8,    # уменьшение высоты квадратика
+            handlelength=1.5)    # уменьшение длины квадратика))
+xmin, ymin, xmax, ymax = gdf.total_bounds
+for ax in axes:
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+plt.tight_layout()
+plt.show()
+```
+
+Центрально-западный максимум в более детальном отображении здесь налицо. А также центр-периферия в классическом ее проявлении.
+По количеству предложения лидер - Поселение Сосенское (ввод метро юга красной ветки, близость ко МКАДу). Также выделяются Раменки, Очаково-Матвеевское, Хорошево-Мневники, Пресня (стройки в Деловом Центре)
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 421}
+# Отрисовываем цену за кв.м. в точечной геометрии
+fig, ax = plt.subplots(figsize=(8, 5))
+
+# Нарисуем полигоны Москвы
+moscow_admin.plot(ax=ax, linewidth=0.7, edgecolor='black', facecolor='none')
+
+# Нарисуем точки квартир
+gdf.plot(
+    ax=ax,
+    column='price_sq_m',
+    cmap='viridis_r',
+    markersize=0.7,
+    alpha=0.5,
+    legend=False  # отключаем встроенную легенду GeoPandas
+)
+
+# Добавляем подложку
+cx.add_basemap(ax, source=cx.providers.CartoDB.Positron)
+
+# Обрезка карты по границам данных
+xmin, ymin, xmax, ymax = gdf.total_bounds
+ax.set_xlim(xmin, xmax)
+ax.set_ylim(ymin, ymax)
+ax.set_axis_off()
+
+# --- Создаем colorbar вручную ---
+norm = mpl.colors.Normalize(vmin=gdf['price_sq_m'].min(), vmax=gdf['price_sq_m'].max())
+sm1 = plt.cm.ScalarMappable(cmap='viridis_r', norm=norm)
+sm1._A = []  # нужно для ScalarMappable
+
+cbar = fig.colorbar(sm1, ax=ax, shrink=0.6)
+cbar.set_label("Цена за кв.м., млн рублей", rotation=90, labelpad=10, fontsize=10)  # подпись слева
+cbar.ax.yaxis.set_label_position('left')  # устанавливаем подпись слева
+
+plt.tight_layout()
+plt.show()
+```
+
+Та же самая визуализация по цене, но в геометрии самих квартир. На самом деле можно увидеть и резкую дифференциацию, связанную с нахождением в границах Москвы. Все за пределами уже на 100-200 тыс. рублей дешевле
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 542}
+# Интерактивная карта kde по стоимости квадратного метра
+# Преобразование GeoDataFrame в EPSG:4326 для Plotly
+gdf_4326 = gdf.to_crs(epsg=4326)
+
+# Извлечение координат широты и долготы
+gdf_4326['lon'] = gdf_4326.geometry.x
+gdf_4326['lat'] = gdf_4326.geometry.y
+
+# Определение центра карты для лучшей визуализации Москвы
+center_lat = gdf_4326.lat.mean()
+center_lon = gdf_4326.lon.mean()
+
+# Создание интерактивной тепловой карты плотности с Plotly Express
+fig = px.density_mapbox(
+    gdf_4326,
+    lat='lat',
+    lon='lon',
+    z='price_sq_m', # Значение, по которому строится плотность
+    radius=3, # Уменьшаем радиус для меньшего перекрытия
+    center={'lat': center_lat, 'lon': center_lon},
+    zoom=9, # Уровень зума для Москвы
+    mapbox_style='carto-positron',
+    title='Тепловая карта цены за квадратный метр',
+    color_continuous_scale='viridis_r' # Меняем палитру на viridis
+)
+fig.update_traces(opacity=0.6) # Делаем слой более прозрачным
+fig.update_layout(margin={'r':0,'t':50,'l':0,'b':0})
+fig.show(renderer="vscode")
+```
+
+Интерактивная карта с "горячими точками" на основе ядерной плотности точек. Сильнее выражаются локальные центры в отдельных районах. Но, генерально, картина классическая
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 446}
+# теперь отрисовываем статичные по стоимости квадрата и количеству предложений
+# 1. Определяем параметры сетки (общие для обеих карт)
+xmin, ymin, xmax, ymax = gdf.total_bounds
+resolution = 200  # Разрешение сетки
+xres = (xmax - xmin) / resolution
+yres = (ymax - ymin) / resolution
+
+# Привязываем точки к ячейкам сетки (общие для обеих карт)
+x_coords = ((gdf.geometry.x - xmin) / xres).astype(int)
+y_coords = ((gdf.geometry.y - ymin) / yres).astype(int)
+
+# Убеждаемся, что координаты находятся в пределах сетки
+x_coords = np.clip(x_coords, 0, resolution - 1)
+y_coords = np.clip(y_coords, 0, resolution - 1)
+
+# --- Подготовка данных для карты плотности объектов ---
+grid_density = np.zeros((resolution, resolution))
+for i in range(len(gdf)):
+    grid_density[y_coords.iloc[i], x_coords.iloc[i]] += 1
+smoothed_density_grid = gaussian_filter(grid_density, sigma=3) # Сглаживание
+
+# --- Подготовка данных для карты средней цены ---
+grid_sum = np.zeros((resolution, resolution))
+grid_count = np.zeros((resolution, resolution))
+for i in range(len(gdf)):
+    grid_sum[y_coords.iloc[i], x_coords.iloc[i]] += gdf['price_sq_m'].iloc[i]
+    grid_count[y_coords.iloc[i], x_coords.iloc[i]] += 1
+grid_mean_price = np.divide(grid_sum, grid_count, out=np.zeros_like(grid_sum), where=grid_count != 0)
+smoothed_price_grid = gaussian_filter(grid_mean_price, sigma=3) # Сглаживание
+
+# --- Создание кастомных палитр с переменной прозрачностью ---
+
+# Для плотности
+cmap_density_base = plt.get_cmap('plasma_r') # Базовая палитра для плотности
+new_cmap_density = cmap_density_base(np.arange(cmap_density_base.N))
+alpha_values = np.linspace(0.0, 1.0, cmap_density_base.N)
+new_cmap_density[:, -1] = alpha_values
+new_cmap_density = mcolors.ListedColormap(new_cmap_density)
+
+# Для средней цены
+cmap_price_base = plt.get_cmap('plasma_r') # Базовая палитра для цен
+new_cmap_price = cmap_price_base(np.arange(cmap_price_base.N))
+alpha_values = np.linspace(0.0, 1.0, cmap_price_base.N)
+new_cmap_price[:, -1] = alpha_values
+new_cmap_price = mcolors.ListedColormap(new_cmap_price)
+
+# --- Визуализация (две карты) ---
+fig, axes = plt.subplots(1, 2, figsize=(10, 5)) # Создаем 2 подграфика
+
+x_edges = np.linspace(xmin, xmax, resolution + 1)
+y_edges = np.linspace(ymin, ymax, resolution + 1)
+
+# Карта 1: Плотность объектов
+im1 = axes[0].pcolormesh(
+    x_edges,
+    y_edges,
+    smoothed_density_grid,
+    cmap=new_cmap_density,
+    zorder=2,
+    shading='flat'
+)
+moscow_admin.plot(ax=axes[0], linewidth=0.7, edgecolor='black', facecolor='none', zorder=3)
+cx.add_basemap(axes[0], source=cx.providers.CartoDB.Positron, zorder=1)
+axes[0].set_title('Плотность объектов недвижимости (сглаженная)', fontsize = 10)
+axes[0].set_axis_off()
+axes[0].set_xlim(xmin, xmax)
+axes[0].set_ylim(ymin, ymax)
+cbar = fig.colorbar(im1, ax=axes[0], shrink=0.3)
+cbar.set_label('Количество объектов', fontsize=8)
+
+# Карта 2: Средняя цена за квадратный метр
+im2 = axes[1].pcolormesh(
+    x_edges,
+    y_edges,
+    smoothed_price_grid,
+    cmap=new_cmap_price,
+    zorder=2,
+    shading='flat'
+)
+moscow_admin.plot(ax=axes[1], linewidth=0.7, edgecolor='black', facecolor='none', zorder=3)
+cx.add_basemap(axes[1], source=cx.providers.CartoDB.Positron, zorder=1)
+axes[1].set_title('Сглаженная цена за квадратный метр', fontsize = 10)
+axes[1].set_axis_off()
+axes[1].set_xlim(xmin, xmax)
+axes[1].set_ylim(ymin, ymax)
+cbar = fig.colorbar(im2, ax=axes[1], shrink=0.3)
+cbar.set_label('Цена за кв. метр, рублей', fontsize=8)
+
+plt.tight_layout()
+plt.show()
+```
+
+Статическая картинка по ядерной плотности (строилась вручную на основе сглаживания гауссовым фильтром). Виден максимум плотность именно около Коммунарки, в Раменках, в Деловом Центре, в Южнопортовом. Ну максимум сглаженной цена за кв. м практически четко вырисовывает Садовое Кольцо, но с "хвостом" в сторону Хамовниковников ("лакомый кусочек" Москвы за счет хорошей доступности, статуса еще с советского времени - здесь селили много партийной и гос. элиты, сейчас добавляется и инфраструктура с благоустройством)
+
+## **Эконометрический анализ**
+
+Для анализа пространственной структуры цен на жильё были использованы методы пространственной эконометрики.
+
+Анализ включал следующие этапы:
+
+1. Проверка наличия пространственной автокорреляции с помощью Moran's I.
+
+2. Оценка базовой OLS-модели.
+
+3. Оценка пространственных моделей:
+
+    - Spatial Lag Model
+
+    - Spatial Error Model.
+
+4. Сравнение моделей и интерпретация результатов.
+
+Результаты показали наличие значимой пространственной зависимости цен, что означает, что стоимость квартиры зависит не только от её характеристик, но и от цен объектов, расположенных поблизости.
+
+Наилучшие результаты продемонстрировала Spatial Lag модель, что указывает на наличие пространственных spillover-эффектов на рынке недвижимости.
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+#предобработка
+features = [
+    'floor',
+    'rooms',
+    'dist_to_metro',
+    'dist_to_center'
+]
+
+target = 'price_sq_m'
+
+gdf_model = gdf.dropna(subset=features + [target]).copy()
+
+
+gdf_model = gdf_model.sample(10000, random_state=42) # сэмплируем до 10 тыс. чтобы считалось быстрее
+
+gdf_model = gdf_model.reset_index(drop=True)
+
+print("Dataset size:", gdf_model.shape)
+```
+
+```{python}
+# подготовка переменных
+y = gdf_model[target]
+
+X = gdf_model[features]
+```
+
+```{python}
+import statsmodels.api as sm
+X_ols = sm.add_constant(X) #константа
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# пространственные веса
+w = KNN.from_dataframe(gdf_model, k=8)
+
+w.transform = 'r'
+
+print("Weights size:", w.n)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# индекс морана
+price = gdf_model[target].values
+
+moran = Moran(price, w)
+
+print("Moran's I:", moran.I)
+print("p-value:", moran.p_sim)
+```
+
+p < 0.05 → есть spatial dependence
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# оценка МНК
+ols_model = sm.OLS(y, X_ols).fit()
+
+print(ols_model.summary())
+```
+
+Модель OLS объясняет около 46% вариации цены за м² и в целом статистически значима (F-тест, p < 0.001), при этом все коэффициенты значимы. Цена жилья увеличивается с этажом и количеством комнат, но снижается с удалением от центра и метро. Высокий condition number может указывать на мультиколлинеарность, поэтому далее стоит проверить пространственную автокорреляцию остатков и рассмотреть пространственные модели.
+
+```{python}
+# сохраняем метрики МНК
+ols_r2 = ols_model.rsquared
+ols_aic = ols_model.aic
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# первая итерация модели с пространственным лагом
+slag_model = GM_Lag(
+    y,
+    X,
+    w=w,
+    name_y=target,
+    name_x=features
+)
+
+print(slag_model.summary)
+```
+
+Делаем модель с пространственным лагом, но убираем незначимые переменные
+
+```{python}
+# убираем незначимое dist_to_metro
+features_gm_lag = [
+    'floor',
+    'rooms',
+    'dist_to_center'
+]
+X_iter = gdf_model[features_gm_lag]
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# вторая итерация
+slag_model = GM_Lag(
+    y,
+    X_iter,
+    w=w,
+    name_y=target,
+    name_x=features_gm_lag
+)
+
+print(slag_model.summary)
+```
+
+Результаты пространственной двухшаговой модели (2SLS) показывают, что модель объясняет значительную часть вариации цены за м² (Pseudo R² ≈ 0.777) и все коэффициенты значимы (p < 0.01). Цена за м² увеличивается с этажом, но снижается с количеством комнат, а влияние расстояния до центра слабое, при этом наблюдается сильный пространственный эффект цены (коэффициент W_price_sq_m > 1), хотя оценка пространственного лага выходит за допустимые границы, поэтому прямые пространственные эффекты не интерпретируются. В целом, цена сильно зависит от характеристик квартиры и пространственных связей с соседними объектами.
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# модель с пространственной ошибкой
+serror_model = GM_Error(
+    y,
+    X,
+    w=w,
+    name_y=target,
+    name_x=features
+)
+
+print(serror_model.summary)
+```
+
+Делаем то же самое с пространственной ошибкой
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# вторая итерация пространственной ошибки
+serror_model = GM_Error(
+    y,
+    X_iter,
+    w=w,
+    name_y=target,
+    name_x=features_gm_lag
+)
+
+print(serror_model.summary)
+```
+
+Результаты модели GM Spatially Weighted Least Squares показывают, что модель объясняет около 41% вариации цены за м² (Pseudo R² = 0.405) и все коэффициенты значимы (p < 0.001). Цена растет с увеличением этажа, снижается с ростом количества комнат и удалением от центра, при этом высокий коэффициент λ (0.911) указывает на сильную пространственную зависимость цен между соседними объектами. В целом, как характеристики квартиры, так и пространственные связи существенно влияют на стоимость жилья.
+
+Проверяем автокорреляцию остатков на наличие пространственной зависимости
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# автокорреляция остатков МНК
+residuals = ols_model.resid
+
+moran_res = Moran(residuals, w)
+
+print("Moran I:", moran_res.I)
+print("p-value:", moran_res.p_sim)
+```
+
+Значение индекса Морана вместе с p-value свидетельствуют о наличии пространственной зависимости остатков, значит использование пространственных спецификаций модели оправданно
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+results = pd.DataFrame({
+    "Model": ["OLS", "Spatial Lag", "Spatial Error"],
+    "R2": [
+        ols_model.rsquared,
+        slag_model.pr2,
+        serror_model.pr2
+    ]
+})
+
+print(results)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 452}
+plt.bar(results["Model"], results["R2"])
+plt.title("Сравнение моделей")
+plt.ylabel("Pseudo R2")
+plt.show()
+```
+
+Модель с пространственным лагом оказалась наиболее информативной, объясняя большую часть вариации цены за м² и учитывая сильные пространственные зависимости между объектами. Она показывает, что стоимость жилья определяется не только характеристиками квартиры (этаж, комнаты, близость к центру), но и ценами соседних объектов, подчеркивая важность локальной рыночной среды.
+Модель с пространственной ошибкой плохо сработала, потому что высокая пространственная зависимость в данных проявляется через сами цены объектов, а не только через случайные ошибки. То есть основной сигнал идёт от влияния соседних цен, а не от коррелированных остатков, поэтому модель на основе пространственной ошибки не смогла корректно уловить эти связи и показала низкую информативность.
+
+Теперь строим хотспоты районов по ценам на недвижимость, на основе локального индекса Морана
+
+```{python}
+# Квин соседство (общие границы)
+w = Queen.from_dataframe(result_ray)
+w.transform = "r"  # row-standardized
+
+y = result_ray['mean_price'].values
+moran_loc = Moran_Local(y, w)
+
+# Определяем значимые области
+sig = moran_loc.p_sim < 0.05
+
+# Категории: 0 — незначимо, 1-4 — квадранты
+lisa_cluster = np.zeros_like(y)
+lisa_cluster[sig & (moran_loc.q==1)] = 1  # HH
+lisa_cluster[sig & (moran_loc.q==2)] = 2  # LH
+lisa_cluster[sig & (moran_loc.q==3)] = 3  # LL
+lisa_cluster[sig & (moran_loc.q==4)] = 4  # HL
+
+result_ray['lisa'] = lisa_cluster
+
+colors = {
+    0: 'lightgrey',  # незначимые
+    1: 'red',        # High-High
+    2: 'blue',       # Low-High
+    3: 'darkblue',   # Low-Low
+    4: 'orange'      # High-Low
+}
+result_ray['lisa_color'] = result_ray['lisa'].map(colors)
+
+fig, ax = plt.subplots(figsize=(10, 10))
+
+# Отрисовка районов по цветам кластеров
+result_ray.plot(
+    color=result_ray['lisa_color'],
+    edgecolor='black',
+    linewidth=0.5,
+    ax=ax            
+)
+
+# Подложка карты
+cx.add_basemap(ax, source=cx.providers.CartoDB.Positron)
+
+# Убираем оси
+ax.set_axis_off()
+
+# Заголовок
+ax.set_title("LISA-карта цены за кв.м. по районам Москвы", fontsize=14)
+
+# Легенда
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor='red', edgecolor='black', label='High-High'),
+    Patch(facecolor='blue', edgecolor='black', label='Low-High'),
+    Patch(facecolor='darkblue', edgecolor='black', label='Low-Low'),
+    Patch(facecolor='orange', edgecolor='black', label='High-Low'),
+    Patch(facecolor='lightgrey', edgecolor='black', label='Not significant')
+]
+ax.legend(handles=legend_elements, loc='lower left', fontsize=10)
+
+plt.tight_layout()
+plt.show()
+```
+
+Данная визуализация показывает значимые районы-соседи по показателю цены за кв. м. То есть можно говорить, что Центр действительно смещен на запад (на ю-з и с-з одновременно). Самая-самая периферия, естественно, это Новая Москва и традиционно нестатусный юго-восток (плавно переходящий в наиболее массовые сегменты недвижимости уже Московской области - Люберцы, в первую очередь)
+
+## **Предсказание цены с помощью методов машинного обучения**
+
+Для задачи прогнозирования цены были построены модели машинного обучения (на основе RandomForest).
+
+Анализ проводился в два этапа:
+
+**Базовая модель**
+
+Модель обучалась только на числовых признаках:
+
+    - этаж
+
+    - количество комнат
+
+    - расстояние до метро
+
+    - расстояние до центра
+
+    - пространственный лаг цен
+
+**Улучшенная модель**
+
+Во второй модели был добавлен категориальный признак района, который был закодирован с помощью one-hot encoding.
+
+Сравнение моделей показало, что включение информации о районе повышает качество прогноза, что подтверждает важность локальных характеристик районов для формирования цен на жильё.
+
+Для интерпретации модели были использованы SHAP-значения, позволяющие определить вклад каждого признака в прогноз.
+
+```{python}
+# предобработка
+numeric_features = [
+    'floor',
+    'rooms',
+    'dist_to_metro',
+    'dist_to_center',
+    #'price_lag'
+]
+
+categorical_features = ['district']
+
+target = 'price_sq_m'
+
+cols = numeric_features + categorical_features + [target]
+
+df = gdf_model[cols].dropna().copy()
+```
+
+```{python}
+# выборки
+train_df, test_df = train_test_split(
+    df,
+    test_size=0.2,
+    random_state=42
+)
+```
+
+```{python}
+# фичи
+X_train_num = train_df[numeric_features]
+X_test_num = test_df[numeric_features]
+
+y_train = train_df[target]
+y_test = test_df[target]
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 97}
+# обучение модели
+rf_numeric = RandomForestRegressor(
+    n_estimators=200,
+    max_depth=12,
+    random_state=42,
+    n_jobs=-1
+)
+
+rf_numeric.fit(X_train_num, y_train)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# метрики для предсказаний
+pred_num = rf_numeric.predict(X_test_num)
+
+r2_num = r2_score(y_test, pred_num)
+mae_num = mean_absolute_error(y_test, pred_num)
+rmse_num = np.sqrt(mean_squared_error(y_test, pred_num))
+
+print("Numeric model R2:", r2_num)
+print("Numeric model MAE:", mae_num)
+print("Numeric model RMSE:", rmse_num)
+```
+
+```{python}
+# кодирование районов для второй модели
+train_dummies = pd.get_dummies(
+    train_df[categorical_features],
+    drop_first=True
+)
+
+test_dummies = pd.get_dummies(
+    test_df[categorical_features],
+    drop_first=True
+)
+
+test_dummies = test_dummies.reindex(
+    columns=train_dummies.columns,
+    fill_value=0
+)
+```
+
+```{python}
+# объединение фичей
+X_train_full = pd.concat(
+    [train_df[numeric_features], train_dummies],
+    axis=1
+)
+
+X_test_full = pd.concat(
+    [test_df[numeric_features], test_dummies],
+    axis=1
+)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 97}
+# модель с районами
+rf_full = RandomForestRegressor(
+    n_estimators=200,
+    max_depth=12,
+    random_state=42,
+    n_jobs=-1
+)
+
+rf_full.fit(X_train_full, y_train)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# метрики для предсказаний
+pred_full = rf_full.predict(X_test_full)
+
+r2_full = r2_score(y_test, pred_full)
+mae_full = mean_absolute_error(y_test, pred_full)
+rmse_full = np.sqrt(mean_squared_error(y_test, pred_full))
+
+print("Improved model R2:", r2_full)
+print("Improved model MAE:", mae_full)
+print("Improved model RMSE:", rmse_full)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# сравнение моделей
+results = pd.DataFrame({
+    "Model": ["Numeric only", "Numeric + District"],
+    "R2": [r2_num, r2_full],
+    "MAE": [mae_num, mae_full]
+})
+
+print(results)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 452}
+plt.bar(results["Model"], results["R2"])
+plt.title("Сравнение моделей")
+plt.ylabel("R2 score")
+plt.show()
+```
+
+Модель с кодификацией районов оказалась лучше по предсказательной способности
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# важность фичей
+importances = pd.Series(
+    rf_full.feature_importances_,
+    index=X_train_full.columns
+)
+
+importances = importances.sort_values(ascending=False)
+
+print(importances.head(10))
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 703}
+importances.head(10).plot(kind='bar')
+
+plt.title("Важность признаков")
+plt.show()
+```
+
+Получилось, что реально сильно объясняют значение цены за кв.м транспортная доступность, а также принадлежность к самым статусным районам: Раменки, Хамовники, Дорогомилово, Хорошево-Мневники, Пресня
+
+```{python}
+#shap-интерпретация
+explainer = shap.TreeExplainer(rf_full)
+
+shap_values = explainer.shap_values(X_test_full)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 957}
+shap.summary_plot(shap_values, X_test_full)
+```
+
+На основе SHAP: 
+- однозначное негативное влияние увеличения расстояния до центра, но с большой вариативностью; 
+- чем выше этаж, тем больше цена за кв. м.;
+- с расстоянием до метро чуть менее однозначно - вероятно появляется "штраф" за слишком высокую активность вблизи станций, он в некоторых наблюдениях может влиять в обратную сторону, чем обычно принято;
+- с наиболее престижными районами все однозначно - принадлежность к ним явно увеличивает цену недвижимости, менее престижные районы (уже упоминавшийся Южнопортовый) так же существенно снижают цену
+
+Посмотрим на взаимодействие признаков расстояния
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 470}
+shap.dependence_plot(
+    "dist_to_metro",
+    shap_values,
+    X_test_full
+)
+```
+
+Взаимодействие с dist_to_center (цвет точек)
+
+Синие точки — квартиры ближе к центру, красные — дальше от центра.
+
+Видно, что:
+
+- Для квартир близких к центру влияние dist_to_metro минимальное (синие точки около нуля).
+
+- Для квартир удаленных от центра влияние больше (красные точки выше).
+
+**Вывод**: модель учитывает комбинацию расстояния до метро и до центра. Квартиры на окраинах сильно выигрывают или проигрывают в цене в зависимости от того, насколько они близки к метро.
+
+- Близко к метро → цена за кв.м. ≈ средняя.
+
+- Среднее расстояние → цена растёт (особенно для окраин).
+
+- Удаленность → эффект стабилизируется.
+
+- Есть взаимодействие с расстоянием до центра: для центра метро менее важно, для окраин — сильнее.
+
+Сделаем интерактивную визуализации ошибок (статичную и интерактивную)
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 471}
+# визуализация ошибок на карте (статика)
+# Расчет ошибок предсказания
+errors = y_test - pred_full
+
+# Получение геометрических данных для тестового набора
+# Используем индексы test_df для сопоставления с оригинальным gdf_model
+test_gdf_geometry = gdf_model.loc[test_df.index, 'geometry']
+
+# Создание GeoDataFrame для визуализации ошибок
+errors_gdf = gpd.GeoDataFrame(
+    test_df.copy(),
+    geometry=test_gdf_geometry,
+    crs=gdf_model.crs
+)
+errors_gdf['prediction_error'] = errors
+
+# Расчет ошибки в стандартных отклонениях
+std_dev_errors = errors_gdf['prediction_error'].std()
+errors_gdf['normalized_error_std'] = errors_gdf['prediction_error'] / std_dev_errors
+
+# Построение тепловой карты ошибок
+fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+
+# Добавляем границы районов Москвы
+moscow_admin.plot(
+    ax=ax,
+    linewidth=0.7,
+    edgecolor='black',
+    facecolor='none' # Делаем полигоны прозрачными, чтобы видеть точки ошибок
+)
+
+errors_gdf.plot(
+    column='normalized_error_std',
+    cmap='seismic', # Изменение на diverging colormap: синий для отрицательных ошибок, белый для нуля, красный для положительных ошибок
+    legend=True,
+    legend_kwds={'label': "Величина ошибки в ст. откл.", 'shrink': 0.35},
+    markersize=10,
+    alpha=0.7,
+    ax=ax
+)
+cx.add_basemap(ax, source=cx.providers.CartoDB.Positron)
+ax.set_title('Пространственное распределение ошибок\n(в стандартных отклонениях)', fontsize = 11)
+ax.set_axis_off()
+xmin, ymin, xmax, ymax = gdf.total_bounds
+ax.set_xlim(xmin, xmax)
+ax.set_ylim(ymin, ymax)
+ax.set_axis_off()
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 542}
+# визуализация ошибок на карте (интерактивно)
+# Преобразование GeoDataFrame в EPSG:4326 для Plotly
+errors_gdf_4326 = errors_gdf.to_crs(epsg=4326)
+
+# Извлечение координат широты и долготы
+errors_gdf_4326['lon'] = errors_gdf_4326.geometry.x
+errors_gdf_4326['lat'] = errors_gdf_4326.geometry.y
+
+# Определение центра карты для лучшей визуализации Москвы
+center_lat = errors_gdf_4326.lat.mean()
+center_lon = errors_gdf_4326.lon.mean()
+
+# Создание интерактивной карты с Plotly Express
+errors_gdf_4326['price_sq_m_r'] = errors_gdf_4326['price_sq_m'].round(0)  # целые рубли
+errors_gdf_4326['prediction_error_r'] = errors_gdf_4326['prediction_error'].round(2)
+errors_gdf_4326['normalized_error_std_r'] = errors_gdf_4326['normalized_error_std'].round(2)
+errors_gdf_4326['dist_to_metro_r'] = errors_gdf_4326['dist_to_metro'].round(0)  # метры
+errors_gdf_4326['dist_to_center_r'] = errors_gdf_4326['dist_to_center'].round(2)
+
+# Переименовываем для отображения в hover (aliases)
+errors_gdf_4326_renamed = errors_gdf_4326.rename(columns={
+    'price_sq_m_r': 'Цена за м²',
+    'prediction_error_r': 'Ошибка предсказания',
+    'normalized_error_std_r': 'Норм. ошибка (σ)',
+    'floor': 'Этаж',
+    'rooms': 'Комнат',
+    'dist_to_metro_r': 'До метро, м',
+    'dist_to_center_r': 'До центра, км'
+})
+
+fig = px.scatter_mapbox(
+    errors_gdf_4326_renamed,
+    lat='lat',
+    lon='lon',
+    color='Норм. ошибка (σ)',
+    color_continuous_scale=px.colors.diverging.balance,  # палитра balance
+    size_max=10,
+    zoom=9,
+    center={'lat': center_lat, 'lon': center_lon},
+    title='Пространственное распределение ошибок модели',
+    mapbox_style='carto-positron',
+    hover_name='district',
+    hover_data={
+        'Цена за м²': True,
+        'Ошибка предсказания': True,
+        'Этаж': True,
+        'Комнат': True,
+        'До метро, м': True,
+        'До центра, км': True,
+        'lat': False,
+        'lon': False
+    }
+)
+
+
+# Добавление границ районов Москвы
+# Преобразуем moscow_admin в GeoJSON формат, который понимает Plotly
+moscow_admin_geojson = moscow_admin.to_crs(epsg=4326).__geo_interface__
+
+
+fig.update_layout(
+    mapbox_layers=[
+        {
+            "sourcetype": "geojson",
+            "source": moscow_admin_geojson,
+            "type": "line",
+            "color": "black",
+            "line": {"width": 0.7}
+        }
+    ]
+)
+
+fig.update_layout(margin={'r':0,'t':50,'l':0,'b':0})
+fig.show()
+```
+
+## Основные результаты и интерпретации
+
+Результаты анализа показывают, что на стоимость недвижимости наиболее сильно влияют следующие факторы:
+
+1. Расположение объекта
+
+    Одним из ключевых факторов является расстояние до центра города. Квартиры, расположенные ближе к центру, как правило, имеют более высокую стоимость.
+
+2. Транспортная доступность
+
+    Расстояние до ближайшей станции метро оказывает значительное влияние на цену: квартиры, расположенные в пешей доступности от метро, стоят дороже.
+
+3. Пространственная структура рынка
+
+    Результаты пространственных моделей показали, что цены на жильё обладают пространственной кластеризацией. Квартиры, расположенные рядом с дорогими объектами, имеют тенденцию стоить дороже.
+
+4. Район
+
+    Добавление информации о районе существенно улучшает качество модели, что подтверждает важность локальных характеристик районов, таких как инфраструктура, качество городской среды и престижность локации.
+
+## Практические выводы
+
+Результаты проекта позволяют сделать несколько практических выводов.
+
+**Для оценки недвижимости**
+
+При оценке стоимости объекта необходимо учитывать не только характеристики квартиры, но и локальные ценовые уровни в районе.
+
+**Для инвесторов**
+
+Районы с растущими ценами могут создавать пространственные spillover-эффекты, что делает инвестиции в соседние объекты потенциально привлекательными.
+
+**Для городского планирования**
+
+Развитие транспортной инфраструктуры (например, строительство новых станций метро) может оказывать значительное влияние на стоимость недвижимости в прилегающих районах.
+
+## Итог
+
+В рамках данного проекта был проведён комплексный анализ факторов, влияющих на стоимость жилой недвижимости, с использованием методов пространственного анализа, эконометрики и машинного обучения.
+
+Результаты показали, что цены на жильё обладают выраженной пространственной структурой: объекты, расположенные вблизи друг от друга, имеют схожий ценовой уровень. Проверка пространственной автокорреляции с помощью Moran's I подтвердила наличие статистически значимой пространственной зависимости, что делает применение пространственных эконометрических моделей оправданным.
+
+Сравнение моделей показало, что Spatial Lag модель лучше описывает структуру данных по сравнению с классической OLS-регрессией. Это свидетельствует о наличии пространственных spillover-эффектов, при которых цены соседних объектов оказывают влияние на стоимость рассматриваемой квартиры.
+
+В рамках секции машинного обучения были построены модели прогнозирования цены за квадратный метр. Добавление категориальной переменной района позволило улучшить качество модели, что подтверждает важность локальных характеристик городской среды для формирования цен на недвижимость. Интерпретация модели с помощью SHAP-значений показала, что ключевыми факторами, влияющими на стоимость жилья, являются:
+
+- расстояние до центра города;
+
+- транспортная доступность (близость к метро);
+
+- локальный ценовой уровень;
+
+- принадлежность к определённому району.
+
+Таким образом, результаты проекта демонстрируют, что цены на недвижимость формируются под влиянием как характеристик отдельных объектов, так и пространственного контекста, в котором они расположены.
+
+### Возможные направления развития проекта
+
+Несмотря на полученные результаты, проект может быть расширен в нескольких направлениях:
+
+- включение дополнительных характеристик объектов недвижимости (площадь, год постройки, тип дома);
+
+- использование более сложных моделей машинного обучения (например, градиентного бустинга);
+
+- учет дополнительных пространственных факторов, таких как близость к паркам, школам или коммерческой инфраструктуре;
+
+- анализ динамики цен во времени при наличии временных данных;
+
+- самостоятельный сбор данных из открытых источников.
+
+Расширение набора признаков и использование более детализированных пространственных данных может позволить построить более точные модели оценки недвижимости и получить дополнительные инсайты о структуре городского рынка жилья.
+
