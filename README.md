@@ -53,3 +53,11 @@
 ## Используемые технологии
 
 Python, pandas, geopandas, scikit-learn, statsmodels, PySAL, SHAP, osmnx, plotly.
+
+## Установка
+
+Установите необходимые библиотеки:
+
+```bash
+pip install -r requirements.txt
+```
